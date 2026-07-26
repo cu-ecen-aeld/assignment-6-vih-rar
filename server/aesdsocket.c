@@ -12,6 +12,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <pthread.h>
+#include <time.h>
 
 #define PORT     "9000"
 #define DATAFILE "/var/tmp/aesdsocketdata"
@@ -21,6 +23,17 @@
 static int server_fd = -1;
 static int client_fd = -1;
 static volatile sig_atomic_t caught_signal = 0;
+static pthread_mutex_t data_mux = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct threadNode_t
+{
+    pthread_t threadId;
+    int clientFd;
+    char clientIp[INET6_ADDRSTRLEN];
+    int finished;
+    struct threadNode_t *next;
+} threadNode_t;
+static threadNode_t *head = NULL;
 
 static void signal_handler(int signo)
 {
@@ -39,6 +52,19 @@ static void cleanup(void)
         server_fd = -1;
     }
     remove(DATAFILE);
+    threadNode_t **p = &head;
+    while( *p )
+    {
+        threadNode_t *n = *p;
+        if( n->finished )
+        {
+            pthread_join( n->threadId, NULL );
+            *p = n->next;
+            free( n );
+            continue;
+        }
+        p = &n->next;
+    }
     closelog();
 }
 
@@ -83,8 +109,12 @@ static int send_file(int fd)
 }
 
 /* Handle one accepted client connection. */
-static void handle_client(int fd, const char *client_ip)
+static void *handle_client( void* arg )
 {
+    threadNode_t *curr_node = ( threadNode_t *)arg;
+    int fd = curr_node->clientFd;
+    const char* client_ip = curr_node->clientIp;
+
     char   *packet     = NULL;
     size_t  packet_len = 0;
     char    buf[BUFSIZE];
@@ -95,8 +125,7 @@ static void handle_client(int fd, const char *client_ip)
         char *tmp = realloc(packet, packet_len + (size_t)nbytes + 1);
         if (!tmp) {
             syslog(LOG_ERR, "realloc failed: %m");
-            free(packet);
-            return;
+            break;
         }
         packet = tmp;
         memcpy(packet + packet_len, buf, (size_t)nbytes);
@@ -109,23 +138,25 @@ static void handle_client(int fd, const char *client_ip)
             size_t write_len = (size_t)(newline - packet) + 1;
 
             /* Append packet (up to and including '\n') to data file */
+            pthread_mutex_lock( &data_mux );
             FILE *fp = fopen(DATAFILE, "a");
             if (!fp) {
                 syslog(LOG_ERR, "fopen %s for append failed: %m", DATAFILE);
-                free(packet);
-                return;
+                pthread_mutex_unlock( &data_mux );
+                break;
             }
             if (fwrite(packet, 1, write_len, fp) != write_len) {
                 syslog(LOG_ERR, "fwrite failed: %m");
                 fclose(fp);
-                free(packet);
-                return;
+                pthread_mutex_unlock( &data_mux );
+                break;
             }
             fclose(fp);
 
             /* Send full file back to client */
             if (send_file(fd) == -1)
                 syslog(LOG_ERR, "send_file failed for %s", client_ip);
+            pthread_mutex_unlock( &data_mux );
 
             size_t remaining = packet_len - write_len;
             if (remaining > 0)
@@ -139,6 +170,10 @@ static void handle_client(int fd, const char *client_ip)
         syslog(LOG_ERR, "recv error from %s: %m", client_ip);
 
     free(packet);
+    close(curr_node->clientFd);
+    curr_node->finished = 1;
+    syslog(LOG_INFO, "Closed connection from %s", client_ip);
+    return NULL;
 }
 
 static void daemonize(void)
@@ -166,6 +201,35 @@ static void daemonize(void)
             close(devnull);
     }
 }
+
+static void* timer_thread( void* arg )
+{
+    (void)arg;
+    while( !caught_signal )
+    {
+        sleep( 10 );
+        if( caught_signal )
+            break;
+        time_t t = time( NULL );
+        struct tm tm;
+        localtime_r( &t, &tm );
+        char timestr[128];
+        strftime(timestr, sizeof(timestr), "timestamp:%Y-%m-%d %H:%M:%S\n", &tm);
+        if (pthread_mutex_lock(&data_mux) == 0) {
+            FILE *fp = fopen(DATAFILE, "a");
+            if (fp) {
+                fwrite(timestr, 1, strlen(timestr), fp);
+                fclose(fp);
+            } else {
+                syslog(LOG_ERR, "timer fopen %s failed: %m", DATAFILE);
+            }
+            pthread_mutex_unlock(&data_mux);
+        } else {
+            syslog(LOG_ERR, "timer pthread_mutex_lock failed: %m");
+        }
+    }
+    return NULL;
+} 
 
 int main(int argc, char *argv[])
 {
@@ -224,6 +288,9 @@ int main(int argc, char *argv[])
         cleanup();
         return -1;
     }
+    pthread_t timer_tid;
+    if (pthread_create(&timer_tid, NULL, timer_thread, NULL) != 0)
+        syslog(LOG_ERR, "Failed to create timer thread: %m");
 
     /* Accept loop */
     while (!caught_signal) {
@@ -248,15 +315,32 @@ int main(int argc, char *argv[])
             inet_ntop(AF_INET6, &s->sin6_addr, client_ip, sizeof(client_ip));
         }
 
+        threadNode_t *curr_thread = malloc( sizeof(threadNode_t) );
+        curr_thread->clientFd = client_fd;
+        strcpy( curr_thread->clientIp, client_ip);
+        curr_thread->finished = 0;
+        curr_thread->next = head;
+        head = curr_thread;
+
         syslog(LOG_INFO, "Accepted connection from %s", client_ip);
-        handle_client(client_fd, client_ip);
-        syslog(LOG_INFO, "Closed connection from %s", client_ip);
+        pthread_create( &curr_thread->threadId, NULL, handle_client, curr_thread );
 
-        close(client_fd);
-        client_fd = -1;
+        threadNode_t **p = &head;
+        while( *p )
+        {
+            threadNode_t *n = *p;
+            if( n->finished )
+            {
+                pthread_join( n->threadId, NULL );
+                *p = n->next;
+                free( n );
+                continue;
+            }
+            p = &n->next;
+        }
     }
-
     syslog(LOG_INFO, "Caught signal, exiting");
     cleanup();
+    pthread_join( timer_tid, NULL );
     return 0;
 }
